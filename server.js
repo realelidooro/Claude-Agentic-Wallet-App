@@ -5,12 +5,53 @@ import { PrivyClient, generateP256KeyPair } from '@privy-io/node';
 
 const app = express();
 app.use(cors());
+
+// ─── Raw body needed for webhook verification ─────────────────────────────────
+app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
+
+const TRADING_ADDRESS = '0xE10848d47ca32e10447a8CAaaA309F5A593323f8';
+const GAS_RESERVE = 0.05; // keep 5% for gas
+const CHAIN_ID = 1;
+const log = [];
+
+// ─── Privy helpers ────────────────────────────────────────────────────────────
+function privy() {
+  return new PrivyClient({
+    appId: process.env.PRIVY_APP_ID,
+    appSecret: process.env.PRIVY_APP_SECRET,
+    webhookSigningSecret: process.env.PRIVY_WEBHOOK_SIGNING_SECRET,
+  });
+}
+
+function walletId() {
+  const id = process.env.PRIVY_WALLET_ID;
+  if (!id) throw new Error('PRIVY_WALLET_ID not set');
+  return id;
+}
+
+function authKey() {
+  const key = process.env.PRIVY_AUTH_PRIVATE_KEY;
+  if (!key) throw new Error('PRIVY_AUTH_PRIVATE_KEY not set');
+  return key;
+}
+
+function addLog(type, message, data) {
+  const entry = {
+    time: new Date().toISOString(),
+    type,
+    message,
+    data: data || null,
+  };
+  log.unshift(entry);
+  if (log.length > 50) log.pop();
+  console.log(`[${type}] ${message}`, data || '');
+}
 
 // ─── Health ───────────────────────────────────────────────────────────────────
 app.get('/health', (_, res) => res.json({ status: 'ok' }));
 
-// ─── Generate keypair (run once to get your keys) ─────────────────────────────
+// ─── Generate keypair ─────────────────────────────────────────────────────────
 app.get('/setup/keypair', async (_, res) => {
   try {
     const { privateKey, publicKey } = await generateP256KeyPair();
@@ -24,25 +65,96 @@ app.get('/setup/keypair', async (_, res) => {
   }
 });
 
-// ─── Privy helpers ────────────────────────────────────────────────────────────
-function privy() {
-  return new PrivyClient({
-    appId: process.env.PRIVY_APP_ID,
-    appSecret: process.env.PRIVY_APP_SECRET,
-  });
-}
+// ─── Webhook: receives deposits from Privy ────────────────────────────────────
+app.post('/webhook', async (req, res) => {
+  try {
+    // Verify signature if signing secret is set
+    let payload;
+    if (process.env.PRIVY_WEBHOOK_SIGNING_SECRET) {
+      try {
+        payload = privy().webhooks().verify({
+          payload: req.body,
+          headers: req.headers,
+        });
+      } catch (e) {
+        addLog('ERROR', 'Webhook signature invalid', e.message);
+        return res.status(401).json({ error: 'Invalid webhook signature' });
+      }
+    } else {
+      payload = JSON.parse(req.body.toString());
+    }
 
-function walletId() {
-  const id = process.env.PRIVY_WALLET_ID;
-  if (!id) throw new Error('PRIVY_WALLET_ID not set in Railway variables');
-  return id;
-}
+    addLog('WEBHOOK', 'Received event: ' + payload.type, payload);
 
-function authPrivateKey() {
-  const key = process.env.PRIVY_AUTH_PRIVATE_KEY;
-  if (!key) throw new Error('PRIVY_AUTH_PRIVATE_KEY not set in Railway variables');
-  return key;
-}
+    // Only act on funds deposited
+    if (payload.type === 'wallet.funds_deposited') {
+      const depositedWei = BigInt(payload.amount || '0');
+      if (depositedWei === 0n) {
+        return res.json({ received: true, action: 'skipped — zero amount' });
+      }
+
+      // Keep 5% for gas, forward 95%
+      const forwardWei = depositedWei * 95n / 100n;
+      const forwardHex = '0x' + forwardWei.toString(16);
+
+      addLog('AGENT', `Forwarding ${forwardWei} wei to trading account`, {
+        to: TRADING_ADDRESS,
+        amount: forwardHex,
+      });
+
+      const response = await privy().wallets().ethereum().sendTransaction(walletId(), {
+        caip2: 'eip155:1',
+        params: {
+          transaction: {
+            to: TRADING_ADDRESS,
+            value: forwardHex,
+            chain_id: CHAIN_ID,
+          },
+        },
+        authorization_context: {
+          authorization_private_keys: [authKey()],
+        },
+      });
+
+      addLog('SUCCESS', 'ETH forwarded to trading account', {
+        txHash: response.hash,
+        explorer: 'https://etherscan.io/tx/' + response.hash,
+      });
+
+      return res.json({
+        received: true,
+        action: 'forwarded',
+        txHash: response.hash,
+        explorer: 'https://etherscan.io/tx/' + response.hash,
+      });
+    }
+
+    // Test webhook from Privy dashboard
+    if (payload.type === 'privy.test') {
+      addLog('TEST', 'Test webhook received successfully');
+      return res.json({ received: true, action: 'test ok' });
+    }
+
+    res.json({ received: true, action: 'ignored' });
+
+  } catch (e) {
+    addLog('ERROR', 'Webhook error', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Activity log ─────────────────────────────────────────────────────────────
+app.get('/logs', (_, res) => res.json(log));
+
+// ─── Wallet info ──────────────────────────────────────────────────────────────
+app.get('/wallet', async (_, res) => {
+  try {
+    const wallet = await privy().wallets().get(walletId());
+    res.json({ walletId: wallet.id, address: wallet.address });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // ─── Create wallet ────────────────────────────────────────────────────────────
 app.post('/wallet/create', async (_, res) => {
@@ -63,17 +175,7 @@ app.post('/wallet/create', async (_, res) => {
   }
 });
 
-// ─── Get wallet ───────────────────────────────────────────────────────────────
-app.get('/wallet', async (_, res) => {
-  try {
-    const wallet = await privy().wallets().get(walletId());
-    res.json({ walletId: wallet.id, address: wallet.address });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ─── Send ETH ─────────────────────────────────────────────────────────────────
+// ─── Manual send ETH ──────────────────────────────────────────────────────────
 app.post('/wallet/send-eth', async (req, res) => {
   try {
     const { to, amountEth } = req.body;
@@ -82,12 +184,13 @@ app.post('/wallet/send-eth', async (req, res) => {
     const response = await privy().wallets().ethereum().sendTransaction(walletId(), {
       caip2: 'eip155:1',
       params: {
-        transaction: { to, value, chain_id: 1 },
+        transaction: { to, value, chain_id: CHAIN_ID },
       },
       authorization_context: {
-        authorization_private_keys: [authPrivateKey()],
+        authorization_private_keys: [authKey()],
       },
     });
+    addLog('MANUAL', 'Manual ETH send', { to, amountEth, txHash: response.hash });
     res.json({
       txHash: response.hash,
       explorer: 'https://etherscan.io/tx/' + response.hash,
@@ -105,7 +208,7 @@ app.post('/wallet/sign', async (req, res) => {
     const response = await privy().wallets().ethereum().signMessage(walletId(), {
       message,
       authorization_context: {
-        authorization_private_keys: [authPrivateKey()],
+        authorization_private_keys: [authKey()],
       },
     });
     res.json({ signature: response.signature });
@@ -141,16 +244,17 @@ app.get('/', (_, res) => res.send(`<!DOCTYPE html>
     .pill{font-size:11px;padding:3px 9px;border-radius:99px;background:var(--blue-bg);color:var(--blue);margin-left:auto}
     .wrap{max-width:560px;margin:0 auto;padding:1.25rem}
     .status{display:flex;align-items:center;gap:8px;margin-bottom:1rem}
-    .dot{width:8px;height:8px;border-radius:50%;background:var(--red);flex-shrink:0}
+    .dot{width:8px;height:8px;border-radius:50%;background:var(--red);flex-shrink:0;transition:background .3s}
     .dot.on{background:var(--green)}
     .card{background:var(--surface);border:0.5px solid var(--border);border-radius:var(--radius);padding:1.25rem;margin-bottom:1rem}
-    .label{font-size:12px;color:var(--text2);margin-bottom:6px}
+    .card-title{font-size:12px;font-weight:500;text-transform:uppercase;letter-spacing:.05em;color:var(--text2);margin-bottom:.75rem}
     .addr{font-size:12px;font-family:monospace;background:var(--surface2);border-radius:var(--radius-sm);padding:.75rem;word-break:break-all;color:var(--text2);margin-bottom:.75rem}
+    .trading{font-size:12px;font-family:monospace;background:var(--surface2);border-radius:var(--radius-sm);padding:.75rem;word-break:break-all;color:var(--green);margin-bottom:.75rem}
     .row{display:flex;gap:8px;flex-wrap:wrap}
     label{font-size:13px;color:var(--text2);display:block;margin-bottom:5px}
     input,textarea{width:100%;font-size:14px;padding:10px 12px;border:0.5px solid var(--border);border-radius:var(--radius-sm);background:var(--surface2);color:var(--text);outline:none;-webkit-appearance:none;font-family:inherit;margin-bottom:.85rem}
     input:focus,textarea:focus{border-color:var(--accent)}
-    .btn{display:inline-flex;align-items:center;gap:5px;font-size:14px;font-weight:500;padding:10px 16px;border-radius:var(--radius-sm);border:0.5px solid var(--border);background:transparent;color:var(--text);cursor:pointer;font-family:inherit;-webkit-appearance:none;white-space:nowrap}
+    .btn{display:inline-flex;align-items:center;gap:5px;font-size:14px;font-weight:500;padding:10px 16px;border-radius:var(--radius-sm);border:0.5px solid var(--border);background:transparent;color:var(--text);cursor:pointer;font-family:inherit;white-space:nowrap;-webkit-appearance:none}
     .btn:active{opacity:.7}
     .btn-p{background:var(--accent);color:var(--accent-fg);border-color:transparent;width:100%;justify-content:center}
     .tabs{display:flex;border-bottom:0.5px solid var(--border);margin-bottom:1rem}
@@ -161,6 +265,16 @@ app.get('/', (_, res) => res.send(`<!DOCTYPE html>
     .out.show{display:block}
     .out.ok{border-left:3px solid var(--green)}
     .out.err{border-left:3px solid var(--red)}
+    .log-entry{padding:.6rem .75rem;border-bottom:0.5px solid var(--border);font-size:12px;font-family:monospace;line-height:1.5}
+    .log-entry:last-child{border-bottom:none}
+    .log-time{color:var(--text2);font-size:11px}
+    .log-SUCCESS{color:var(--green)}
+    .log-ERROR{color:var(--red)}
+    .log-AGENT{color:var(--blue)}
+    .log-WEBHOOK{color:var(--text2)}
+    .log-MANUAL{color:var(--text)}
+    .log-TEST{color:var(--text2)}
+    .empty{padding:1rem;text-align:center;color:var(--text2);font-size:13px}
     a{color:var(--blue)}
   </style>
 </head>
@@ -182,29 +296,31 @@ app.get('/', (_, res) => res.send(`<!DOCTYPE html>
   </div>
 
   <div class="card">
-    <div class="label">Wallet address</div>
+    <div class="card-title">Agent wallet</div>
     <div class="addr" id="addr">—</div>
+    <div class="card-title" style="margin-top:.5rem">Auto-forwards to</div>
+    <div class="trading">${TRADING_ADDRESS}</div>
     <div class="row">
       <button class="btn" onclick="loadWallet()">↻ Refresh</button>
       <a id="scan" href="#" target="_blank" class="btn" style="display:none">↗ Etherscan</a>
-      <button class="btn" onclick="createWallet()">+ Create wallet</button>
     </div>
-    <div id="create-out" class="out"></div>
+    <div id="wallet-out" class="out"></div>
   </div>
 
   <div class="card">
     <div class="tabs">
-      <button class="tab on" onclick="tab('eth')">Send ETH</button>
-      <button class="tab" onclick="tab('sign')">Sign message</button>
+      <button class="tab on" onclick="tab('send')">Send ETH</button>
+      <button class="tab" onclick="tab('sign')">Sign</button>
+      <button class="tab" onclick="tab('logs')">Activity log</button>
     </div>
 
-    <div id="p-eth" class="panel on">
+    <div id="p-send" class="panel on">
       <label>Recipient address</label>
       <input id="eth-to" type="text" placeholder="0x..." autocorrect="off" autocapitalize="none" spellcheck="false"/>
       <label>Amount (ETH)</label>
       <input id="eth-amt" type="number" placeholder="0.01" step="any" inputmode="decimal"/>
       <button class="btn btn-p" onclick="sendEth()">Send ETH</button>
-      <div id="eth-out" class="out"></div>
+      <div id="send-out" class="out"></div>
     </div>
 
     <div id="p-sign" class="panel">
@@ -212,6 +328,13 @@ app.get('/', (_, res) => res.send(`<!DOCTYPE html>
       <textarea id="sign-msg" rows="4" placeholder="I approve this action…"></textarea>
       <button class="btn btn-p" onclick="signMsg()">Sign message</button>
       <div id="sign-out" class="out"></div>
+    </div>
+
+    <div id="p-logs" class="panel">
+      <div class="row" style="margin-bottom:.75rem">
+        <button class="btn" onclick="loadLogs()">↻ Refresh logs</button>
+      </div>
+      <div id="log-list"><div class="empty">No activity yet</div></div>
     </div>
   </div>
 
@@ -231,11 +354,14 @@ app.get('/', (_, res) => res.send(`<!DOCTYPE html>
 
   async function ping() {
     try {
-      await req('/health');
-      document.getElementById('dot').classList.add('on');
-      document.getElementById('st').textContent = 'Connected ✓';
-      loadWallet();
-    } catch (e) {
+      const d = await req('/health');
+      if (d.status === 'ok' || d.paused === false) {
+        document.getElementById('dot').classList.add('on');
+        document.getElementById('st').textContent = 'Connected ✓ — agent active';
+        loadWallet();
+        loadLogs();
+      }
+    } catch(e) {
       document.getElementById('st').textContent = '❌ ' + e.message;
     }
   }
@@ -247,32 +373,21 @@ app.get('/', (_, res) => res.send(`<!DOCTYPE html>
       const s = document.getElementById('scan');
       s.href = 'https://etherscan.io/address/' + d.address;
       s.style.display = 'inline-flex';
-    } catch (e) {
+    } catch(e) {
       document.getElementById('addr').textContent = '⚠️ ' + e.message;
     }
-  }
-
-  async function createWallet() {
-    out('create-out', '⏳ Creating…', 'ok');
-    try {
-      const d = await req('/wallet/create', 'POST');
-      out('create-out',
-        '✅ Wallet created!\n' +
-        'ID: ' + d.walletId + '\n' +
-        'Address: ' + d.address + '\n\n' +
-        '⚠️ Add PRIVY_WALLET_ID to Railway variables!', 'ok');
-    } catch (e) { out('create-out', '❌ ' + e.message, 'err'); }
   }
 
   async function sendEth() {
     const to  = document.getElementById('eth-to').value.trim();
     const amt = document.getElementById('eth-amt').value.trim();
-    if (!to || !amt) { out('eth-out', '⚠️ Fill in both fields.', 'err'); return; }
-    out('eth-out', '⏳ Sending…', 'ok');
+    if (!to || !amt) { out('send-out', '⚠️ Fill in both fields.', 'err'); return; }
+    out('send-out', '⏳ Sending…', 'ok');
     try {
       const d = await req('/wallet/send-eth', 'POST', { to, amountEth: amt });
-      out('eth-out', '✅ Sent!\n' + d.explorer, 'ok');
-    } catch (e) { out('eth-out', '❌ ' + e.message, 'err'); }
+      out('send-out', '✅ Sent!\n' + d.explorer, 'ok');
+      setTimeout(loadLogs, 2000);
+    } catch(e) { out('send-out', '❌ ' + e.message, 'err'); }
   }
 
   async function signMsg() {
@@ -282,7 +397,22 @@ app.get('/', (_, res) => res.send(`<!DOCTYPE html>
     try {
       const d = await req('/wallet/sign', 'POST', { message: msg });
       out('sign-out', '✅ Signed!\n' + d.signature, 'ok');
-    } catch (e) { out('sign-out', '❌ ' + e.message, 'err'); }
+    } catch(e) { out('sign-out', '❌ ' + e.message, 'err'); }
+  }
+
+  async function loadLogs() {
+    try {
+      const logs = await req('/logs');
+      const el = document.getElementById('log-list');
+      if (!logs.length) { el.innerHTML = '<div class="empty">No activity yet</div>'; return; }
+      el.innerHTML = logs.map(l => \`
+        <div class="log-entry">
+          <div class="log-\${l.type} ">\${l.type} — \${l.message}</div>
+          \${l.data ? '<div style="color:var(--text2);font-size:11px;margin-top:2px">' + JSON.stringify(l.data) + '</div>' : ''}
+          <div class="log-time">\${new Date(l.time).toLocaleString()}</div>
+        </div>
+      \`).join('');
+    } catch(e) {}
   }
 
   function out(id, text, type) {
@@ -292,17 +422,21 @@ app.get('/', (_, res) => res.send(`<!DOCTYPE html>
   }
 
   function tab(name) {
-    document.querySelectorAll('.tab').forEach((t, i) =>
-      t.classList.toggle('on', ['eth', 'sign'][i] === name));
-    document.querySelectorAll('.panel').forEach(p =>
-      p.classList.toggle('on', p.id === 'p-' + name));
+    document.querySelectorAll('.tab').forEach((t, i) => {
+      t.classList.remove('on');
+      if (['send','sign','logs'][i] === name) t.classList.add('on');
+    });
+    document.querySelectorAll('.panel').forEach(p => {
+      p.classList.remove('on');
+      if (p.id === 'p-' + name) p.classList.add('on');
+    });
+    if (name === 'logs') loadLogs();
   }
 
-  ping();
+  window.addEventListener('DOMContentLoaded', ping);
 </script>
 </body>
 </html>`));
 
-// ─── Start ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('🚀 Claude Agent Wallet on port ' + PORT));
